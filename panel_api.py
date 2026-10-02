@@ -106,13 +106,19 @@ class PanelClient:
 
         data_limit = volume_gb * 1024 * 1024 * 1024 if volume_gb > 0 else 0
 
+        # فقط حروف و عدد و _ و - در نام کاربری
+        import re as _re
+        safe_user = _re.sub(r"[^a-zA-Z0-9_\-]", "", username)[:32]
+        if not safe_user:
+            return None, "نام کاربری نامعتبر"
+
         payload = {
-            "username": username,
+            "username": safe_user,
             "status": "active",
             "expire": expire,
             "data_limit": data_limit,
             "data_limit_reset_strategy": "no_reset",
-            "note": note,
+            "note": (note or "")[:200],
         }
         if group_ids:
             payload["group_ids"] = group_ids

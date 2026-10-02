@@ -68,6 +68,32 @@ async def init_db():
             group_ids TEXT DEFAULT '[]',
             is_connected INTEGER DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS coupons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            discount_type TEXT DEFAULT 'percent',
+            discount_value INTEGER NOT NULL,
+            max_uses INTEGER DEFAULT 0,
+            used_count INTEGER DEFAULT 0,
+            min_order INTEGER DEFAULT 0,
+            expire_at TEXT DEFAULT '',
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS coupon_uses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            coupon_id INTEGER,
+            user_id INTEGER,
+            used_at TEXT,
+            UNIQUE(coupon_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS trials (
+            user_id INTEGER PRIMARY KEY,
+            used_at TEXT
+        );
         """)
         await db.commit()
 
@@ -83,6 +109,9 @@ async def init_db():
             "ref_percent": "20",
             "support_text": "برای پشتیبانی به @YourSupport پیام دهید",
             "welcome_text": "به فروشگاه خوش آمدید 👋\nاز منوی زیر استفاده کنید.",
+            "force_channel": "",
+            "force_channel_id": "0",
+            "custom_username": "1",
         }
         for k, v in defaults.items():
             await db.execute(
@@ -148,12 +177,28 @@ async def get_user(tg_id: int) -> Optional[dict]:
         return dict(row) if row else None
 
 
-async def update_balance(tg_id: int, amount: int):
+async def update_balance(tg_id: int, amount: int) -> bool:
+    """افزایش/کاهش موجودی. اگر amount منفی باشد و موجودی کافی نباشد False برمی‌گرداند."""
     async with aiosqlite.connect(DB_PATH) as db:
+        if amount < 0:
+            cur = await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE tg_id = ? AND balance >= ?",
+                (amount, tg_id, abs(amount)),
+            )
+            await db.commit()
+            return cur.rowcount > 0
         await db.execute(
             "UPDATE users SET balance = balance + ? WHERE tg_id = ?", (amount, tg_id)
         )
         await db.commit()
+        return True
+
+
+async def is_user_blocked(tg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT is_blocked FROM users WHERE tg_id = ?", (tg_id,))
+        row = await cur.fetchone()
+        return bool(row and row[0])
 
 
 async def set_ref(tg_id: int, ref_by: int):
@@ -262,13 +307,15 @@ async def get_pending_receipts() -> List[dict]:
         return [dict(r) for r in await cur.fetchall()]
 
 
-async def set_receipt_status(rid: int, status: str, note: str = ""):
+async def set_receipt_status(rid: int, status: str, note: str = "") -> bool:
+    """فقط اگر هنوز pending باشد آپدیت می‌کند. True = موفق"""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE receipts SET status=?, admin_note=? WHERE id=?",
+        cur = await db.execute(
+            "UPDATE receipts SET status=?, admin_note=? WHERE id=? AND status='pending'",
             (status, note, rid),
         )
         await db.commit()
+        return cur.rowcount > 0
 
 
 async def get_receipt(rid: int) -> Optional[dict]:
@@ -277,3 +324,117 @@ async def get_receipt(rid: int) -> Optional[dict]:
         cur = await db.execute("SELECT * FROM receipts WHERE id = ?", (rid,))
         row = await cur.fetchone()
         return dict(row) if row else None
+
+# ---------- Coupons ----------
+async def add_coupon(code: str, discount_type: str, discount_value: int, max_uses: int = 0, min_order: int = 0, expire_at: str = "") -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        now = datetime.utcnow().isoformat()
+        cur = await db.execute(
+            "INSERT INTO coupons (code, discount_type, discount_value, max_uses, min_order, expire_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (code.upper().strip(), discount_type, discount_value, max_uses, min_order, expire_at, now),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_coupon(code: str) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM coupons WHERE code = ? AND is_active = 1", (code.upper().strip(),))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def list_coupons() -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM coupons ORDER BY id DESC")
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def use_coupon(coupon_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            now = datetime.utcnow().isoformat()
+            await db.execute(
+                "INSERT INTO coupon_uses (coupon_id, user_id, used_at) VALUES (?, ?, ?)",
+                (coupon_id, user_id, now),
+            )
+            await db.execute(
+                "UPDATE coupons SET used_count = used_count + 1 WHERE id = ?", (coupon_id,)
+            )
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def has_used_coupon(coupon_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM coupon_uses WHERE coupon_id = ? AND user_id = ?",
+            (coupon_id, user_id),
+        )
+        return await cur.fetchone() is not None
+
+
+async def delete_coupon(cid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM coupons WHERE id = ?", (cid,))
+        await db.commit()
+
+
+# ---------- User management ----------
+async def set_user_balance(tg_id: int, balance: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = ? WHERE tg_id = ?", (balance, tg_id))
+        await db.commit()
+
+
+async def set_user_blocked(tg_id: int, blocked: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET is_blocked = ? WHERE tg_id = ?", (1 if blocked else 0, tg_id)
+        )
+        await db.commit()
+
+
+async def search_users(query: str, limit: int = 20) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        q = f"%{query}%"
+        cur = await db.execute(
+            "SELECT * FROM users WHERE CAST(tg_id AS TEXT) LIKE ? OR username LIKE ? OR full_name LIKE ? LIMIT ?",
+            (q, q, q, limit),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def count_users() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users")
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def get_all_user_ids() -> List[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT tg_id FROM users WHERE is_blocked = 0")
+        return [r[0] for r in await cur.fetchall()]
+
+
+# ---------- Trial ----------
+async def has_used_trial(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT 1 FROM trials WHERE user_id = ?", (user_id,))
+        return await cur.fetchone() is not None
+
+
+async def mark_trial_used(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        now = datetime.utcnow().isoformat()
+        await db.execute(
+            "INSERT OR REPLACE INTO trials (user_id, used_at) VALUES (?, ?)",
+            (user_id, now),
+        )
+        await db.commit()
