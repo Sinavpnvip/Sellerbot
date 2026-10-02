@@ -321,7 +321,10 @@ async def adm_approve(callback: CallbackQuery):
     if not r or r["status"] != "pending":
         await callback.answer("قبلاً بررسی شده", show_alert=True)
         return
-    await set_receipt_status(rid, "approved")
+    ok = await set_receipt_status(rid, "approved")
+    if not ok:
+        await callback.answer("قبلاً بررسی شده", show_alert=True)
+        return
     await update_balance(r["user_id"], r["amount"])
     try:
         await callback.bot.send_message(
@@ -350,7 +353,10 @@ async def adm_reject(callback: CallbackQuery):
     if not r or r["status"] != "pending":
         await callback.answer("قبلاً بررسی شده", show_alert=True)
         return
-    await set_receipt_status(rid, "rejected")
+    ok = await set_receipt_status(rid, "rejected")
+    if not ok:
+        await callback.answer("قبلاً بررسی شده", show_alert=True)
+        return
     try:
         await callback.bot.send_message(r["user_id"], "❌ رسید شما رد شد. با پشتیبانی در تماس باشید.")
     except Exception:
