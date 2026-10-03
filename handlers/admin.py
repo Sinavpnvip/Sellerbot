@@ -62,17 +62,39 @@ async def adm_panel(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in settings.admins:
         return
     p = await get_panel()
-    status = "✅ متصل" if p.get("is_connected") else "❌ متصل نیست"
+    ptype = p.get("panel_type") or "pasarguard"
     text = (
-        f"🔗 <b>اتصال به پنل JinX / PasarGuard</b>\n\n"
-        f"وضعیت: {status}\n"
-        f"آدرس فعلی: <code>{p.get('base_url') or '—'}</code>\n"
-        f"یوزرنیم: <code>{p.get('username') or '—'}</code>\n\n"
-        f"برای تنظیم مجدد، آدرس پنل را ارسال کنید:\n"
-        f"مثال: https://xxxx.up.railway.app"
+        f"🔗 <b>اتصال پنل</b>\n\n"
+        f"نوع فعلی: <code>{ptype}</code>\n"
+        f"آدرس: <code>{p.get('base_url') or '—'}</code>\n"
+        f"یوزر: <code>{p.get('username') or '—'}</code>\n\n"
+        f"اول نوع پنل را انتخاب کنید:"
     )
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"adm:ptype:{key}")]
+            for key, label in PANEL_TYPES]
+    rows.append([InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin")])
+    await callback.message.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:ptype:"))
+async def adm_ptype(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in settings.admins:
+        return
+    ptype = callback.data.split(":")[2]
+    await state.update_data(panel_type=ptype)
     await state.set_state(AdminStates.panel_url)
-    await callback.message.edit_text(text, reply_markup=back_to_menu(), parse_mode="HTML")
+    hint = "مثال: https://panel.example.com"
+    if ptype == "hiddify":
+        hint = "آدرس پنل Hiddify (بدون /admin)\nبعداً API Key را به‌جای رمز می‌فرستید"
+    await callback.message.edit_text(
+        f"نوع: <b>{ptype}</b>\n\nآدرس پنل را بفرستید:\n{hint}",
+        parse_mode="HTML",
+        reply_markup=back_to_menu(),
+    )
     await callback.answer()
 
 
@@ -85,6 +107,12 @@ async def panel_url(message: Message, state: FSMContext):
         await message.answer("آدرس باید با http یا https شروع شود.")
         return
     await state.update_data(panel_url=url)
+    data = await state.get_data()
+    if data.get("panel_type") == "hiddify":
+        await state.update_data(panel_user="admin")
+        await state.set_state(AdminStates.panel_pass)
+        await message.answer("API Key هیدیفای را بفرستید (از تنظیمات پنل):")
+        return
     await state.set_state(AdminStates.panel_user)
     await message.answer("یوزرنیم ادمین پنل را وارد کنید:")
 
@@ -104,25 +132,29 @@ async def panel_pass(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     url = data["panel_url"]
-    user = data["panel_user"]
+    user = data.get("panel_user") or "admin"
     password = message.text.strip()
+    ptype = data.get("panel_type") or "pasarguard"
 
-    client = PanelClient(url, user, password)
+    client = PanelClient(url, user, password, panel_type=ptype)
     ok, msg = await client.test_connection()
+    token = client.token or ""
+    groups = []
+    if ok:
+        try:
+            groups = await client.get_groups()
+        except Exception:
+            groups = []
     await client.close()
 
     if ok:
-        # گرفتن گروه‌ها
-        client2 = PanelClient(url, user, password)
-        await client2.login()
-        groups = await client2.get_groups()
-        await client2.close()
-        gids = [g.get("id") for g in groups if g.get("id")] if groups else []
-        await save_panel(url, user, password, group_ids=json.dumps(gids))
+        gids = [g.get("id") for g in groups if isinstance(g, dict) and g.get("id")] if groups else []
+        await save_panel(url, user, password, token=token, group_ids=json.dumps(gids), panel_type=ptype)
         await state.clear()
         await message.answer(
-            f"✅ {msg}\n\nگروه‌های پیدا شده: {len(gids)}\nاتصال ذخیره شد.",
+            f"✅ {msg}\nنوع: <code>{ptype}</code>\nگروه‌ها: {len(gids)}\nاتصال ذخیره شد.",
             reply_markup=admin_menu(),
+            parse_mode="HTML",
         )
     else:
         await state.clear()

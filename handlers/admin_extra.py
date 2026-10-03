@@ -11,8 +11,10 @@ from database import (
     search_users, count_users, get_all_user_ids, update_balance,
     add_coupon, list_coupons, get_coupon, delete_coupon,
     has_used_trial, mark_trial_used,
+    get_open_tickets, get_ticket, reply_ticket,
+    get_volume_packs, add_volume_pack, delete_volume_pack,
 )
-from keyboards import admin_menu, back_admin, coupons_admin_kb, user_manage_kb, back_to_menu
+from keyboards import admin_menu, back_admin, coupons_admin_kb, user_manage_kb, back_to_menu, tickets_kb
 from panel_api import get_client_from_db
 import secrets
 import json
@@ -21,6 +23,12 @@ router = Router()
 
 
 class ExtraStates(StatesGroup):
+    ticket_reply = State()
+    msg_user = State()
+    vol_title = State()
+    vol_gb = State()
+    vol_price = State()
+    remind_days = State()
     coupon_code = State()
     coupon_type = State()
     coupon_value = State()
@@ -448,9 +456,267 @@ async def set_force_ch(msg: Message, state: FSMContext):
     if not t.startswith("@"):
         t = "@" + t
     await set_setting("force_channel", t)
+    # گرفتن chat id برای چک مطمئن‌تر
+    info = ""
+    try:
+        chat = await msg.bot.get_chat(t)
+        await set_setting("force_channel_id", str(chat.id))
+        # تست دسترسی: وضعیت خود ادمین
+        me = await msg.bot.get_me()
+        member = await msg.bot.get_chat_member(chat.id, me.id)
+        st = str(getattr(member, "status", "")).lower()
+        if "administrator" in st or "creator" in st:
+            info = f"\n✅ ربات ادمین کانال است\nID: <code>{chat.id}</code>"
+        else:
+            info = f"\n⚠️ ربات ادمین کانال نیست — عضویت چک نمی‌شود.\nID: <code>{chat.id}</code>"
+    except Exception as e:
+        await set_setting("force_channel_id", "0")
+        info = f"\n⚠️ نتوانست کانال را بخواند: {e}\nیوزرنیم را چک کن و ربات را ادمین کن."
     await state.clear()
     await msg.answer(
-        f"✅ کانال اجباری: {t}\n"
-        f"ربات باید ادمین کانال باشد تا بتواند عضویت را چک کند.",
+        f"✅ کانال اجباری: {t}{info}",
         reply_markup=admin_menu(),
+        parse_mode="HTML",
     )
+
+
+
+# ---------- Tickets ----------
+@router.callback_query(F.data == "adm:tickets")
+async def adm_tickets(cb: CallbackQuery):
+    if not _admin(cb.from_user.id):
+        return
+    tickets = await get_open_tickets(40)
+    if not tickets:
+        await cb.message.edit_text("تیکت بازی وجود ندارد.", reply_markup=admin_menu())
+    else:
+        await cb.message.edit_text(
+            f"💬 {len(tickets)} تیکت باز:",
+            reply_markup=tickets_kb(tickets),
+        )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("adm:ticket:"))
+async def adm_ticket_view(cb: CallbackQuery, state: FSMContext):
+    if not _admin(cb.from_user.id):
+        return
+    tid = int(cb.data.split(":")[2])
+    t = await get_ticket(tid)
+    if not t:
+        await cb.answer("یافت نشد", show_alert=True)
+        return
+    await state.set_state(ExtraStates.ticket_reply)
+    await state.update_data(ticket_id=tid, ticket_user=t["user_id"])
+    text = (
+        f"💬 تیکت #{tid}\n"
+        f"کاربر: <code>{t['user_id']}</code>\n"
+        f"وضعیت: {t['status']}\n\n"
+        f"{t['message']}\n\n"
+        f"پاسخ خود را بنویسید:"
+    )
+    await cb.message.answer(text, parse_mode="HTML", reply_markup=back_admin())
+    await cb.answer()
+
+
+@router.message(ExtraStates.ticket_reply)
+async def ticket_reply_msg(msg: Message, state: FSMContext):
+    if not _admin(msg.from_user.id):
+        return
+    data = await state.get_data()
+    tid = data.get("ticket_id")
+    uid = data.get("ticket_user")
+    reply = (msg.text or "").strip()
+    if not reply or not tid:
+        await msg.answer("پاسخ خالی است.")
+        return
+    ok = await reply_ticket(int(tid), reply)
+    await state.clear()
+    if not ok:
+        await msg.answer("این تیکت قبلاً پاسخ داده شده یا پیدا نشد.", reply_markup=admin_menu())
+        return
+    try:
+        await msg.bot.send_message(
+            int(uid),
+            f"💬 <b>پاسخ پشتیبانی (تیکت #{tid})</b>\n\n{reply}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await msg.answer("✅ پاسخ ارسال شد.", reply_markup=admin_menu())
+
+
+# ---------- Message user from admin ----------
+@router.callback_query(F.data.startswith("adm:msguser:"))
+async def adm_msguser(cb: CallbackQuery, state: FSMContext):
+    if not _admin(cb.from_user.id):
+        return
+    uid = int(cb.data.split(":")[2])
+    await state.set_state(ExtraStates.msg_user)
+    await state.update_data(msg_target=uid)
+    await cb.message.answer(f"پیام برای کاربر <code>{uid}</code> را بنویسید:", parse_mode="HTML")
+    await cb.answer()
+
+
+@router.message(ExtraStates.msg_user)
+async def msg_user_send(msg: Message, state: FSMContext):
+    if not _admin(msg.from_user.id):
+        return
+    data = await state.get_data()
+    uid = data.get("msg_target")
+    text = (msg.text or "").strip()
+    await state.clear()
+    if not uid or not text:
+        await msg.answer("لغو شد.", reply_markup=admin_menu())
+        return
+    try:
+        await msg.bot.send_message(int(uid), f"📨 پیام پشتیبانی:\n\n{text}")
+        await msg.answer("✅ ارسال شد.", reply_markup=admin_menu())
+    except Exception as e:
+        await msg.answer(f"❌ ارسال نشد: {e}", reply_markup=admin_menu())
+
+
+
+# ---------- Volume packs admin ----------
+@router.callback_query(F.data == "adm:volpacks")
+async def adm_volpacks(cb: CallbackQuery):
+    if not _admin(cb.from_user.id):
+        return
+    packs = await get_volume_packs(active_only=False)
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+    b = InlineKeyboardBuilder()
+    for p in packs:
+        b.row(InlineKeyboardButton(
+            text=f"{p['title']} | {p['gb']}GB | {p['price']:,}",
+            callback_data=f"adm:delvol:{p['id']}",
+        ))
+    b.row(InlineKeyboardButton(text="➕ پکیج جدید", callback_data="adm:addvol"))
+    en = await get_setting("volume_enabled", "1")
+    b.row(InlineKeyboardButton(
+        text=("🟢 حجم اضافه فعال" if en == "1" else "🔴 حجم اضافه خاموش"),
+        callback_data="adm:toggle_vol",
+    ))
+    b.row(InlineKeyboardButton(text="⬅️ بازگشت", callback_data="admin"))
+    await cb.message.edit_text(
+        "📶 <b>پکیج‌های حجم اضافه</b>\nروی هر مورد بزنید تا حذف شود.",
+        reply_markup=b.as_markup(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:toggle_vol")
+async def toggle_vol(cb: CallbackQuery):
+    if not _admin(cb.from_user.id):
+        return
+    cur = await get_setting("volume_enabled", "1")
+    await set_setting("volume_enabled", "0" if cur == "1" else "1")
+    await cb.answer("ذخیره شد")
+    await adm_volpacks(cb)
+
+
+@router.callback_query(F.data == "adm:addvol")
+async def adm_addvol(cb: CallbackQuery, state: FSMContext):
+    if not _admin(cb.from_user.id):
+        return
+    await state.set_state(ExtraStates.vol_title)
+    await cb.message.edit_text("عنوان پکیج را بفرستید:\nمثال: ۱۰ گیگ اضافه", reply_markup=back_admin())
+    await cb.answer()
+
+
+@router.message(ExtraStates.vol_title)
+async def vol_title(msg: Message, state: FSMContext):
+    if not _admin(msg.from_user.id):
+        return
+    await state.update_data(vol_title=msg.text.strip())
+    await state.set_state(ExtraStates.vol_gb)
+    await msg.answer("حجم به گیگابایت (عدد):")
+
+
+@router.message(ExtraStates.vol_gb)
+async def vol_gb(msg: Message, state: FSMContext):
+    if not _admin(msg.from_user.id):
+        return
+    try:
+        gb = int(msg.text.strip())
+    except Exception:
+        await msg.answer("عدد وارد کنید.")
+        return
+    await state.update_data(vol_gb=gb)
+    await state.set_state(ExtraStates.vol_price)
+    await msg.answer("قیمت به تومان (عدد):")
+
+
+@router.message(ExtraStates.vol_price)
+async def vol_price(msg: Message, state: FSMContext):
+    if not _admin(msg.from_user.id):
+        return
+    try:
+        price = int(msg.text.strip().replace(",", ""))
+    except Exception:
+        await msg.answer("عدد وارد کنید.")
+        return
+    data = await state.get_data()
+    await add_volume_pack(data["vol_title"], int(data["vol_gb"]), price)
+    await state.clear()
+    await msg.answer("✅ پکیج حجم ذخیره شد.", reply_markup=admin_menu())
+
+
+@router.callback_query(F.data.startswith("adm:delvol:"))
+async def adm_delvol(cb: CallbackQuery):
+    if not _admin(cb.from_user.id):
+        return
+    pid = int(cb.data.split(":")[2])
+    await delete_volume_pack(pid)
+    await cb.answer("حذف شد")
+    await adm_volpacks(cb)
+
+
+# ---------- Reminder settings ----------
+@router.callback_query(F.data == "adm:remind")
+async def adm_remind(cb: CallbackQuery, state: FSMContext):
+    if not _admin(cb.from_user.id):
+        return
+    en = await get_setting("remind_enabled", "1")
+    days = await get_setting("remind_days", "3,1")
+    ren = await get_setting("renew_enabled", "1")
+    st = await get_setting("status_enabled", "1")
+    text = (
+        f"⏰ <b>یادآوری و سرویس</b>\n\n"
+        f"یادآوری: {'فعال' if en=='1' else 'خاموش'}\n"
+        f"روزهای یادآوری: <code>{days}</code>\n"
+        f"تمدید: {'فعال' if ren=='1' else 'خاموش'}\n"
+        f"وضعیت زنده: {'فعال' if st=='1' else 'خاموش'}\n\n"
+        f"روزهای یادآوری را با کاما بفرستید\nمثال: <code>7,3,1</code>\n"
+        f"یا off برای خاموش کردن یادآوری"
+    )
+    await state.set_state(ExtraStates.remind_days)
+    await cb.message.edit_text(text, reply_markup=back_admin(), parse_mode="HTML")
+    await cb.answer()
+
+
+@router.message(ExtraStates.remind_days)
+async def set_remind_days(msg: Message, state: FSMContext):
+    if not _admin(msg.from_user.id):
+        return
+    t = msg.text.strip().lower()
+    if t in ("off", "0", "خاموش"):
+        await set_setting("remind_enabled", "0")
+        await state.clear()
+        await msg.answer("یادآوری خاموش شد.", reply_markup=admin_menu())
+        return
+    # also allow toggles: renew on/off via keywords
+    if t.startswith("renew"):
+        await set_setting("renew_enabled", "0" if "off" in t else "1")
+        await state.clear()
+        await msg.answer("تنظیم تمدید ذخیره شد.", reply_markup=admin_menu())
+        return
+    parts = [x.strip() for x in t.split(",") if x.strip().isdigit()]
+    if not parts:
+        await msg.answer("فرمت: 3,1")
+        return
+    await set_setting("remind_days", ",".join(parts))
+    await set_setting("remind_enabled", "1")
+    await state.clear()
+    await msg.answer(f"✅ یادآوری در روزهای {','.join(parts)} قبل از انقضا", reply_markup=admin_menu())
