@@ -66,7 +66,8 @@ async def init_db():
             password TEXT DEFAULT '',
             token TEXT DEFAULT '',
             group_ids TEXT DEFAULT '[]',
-            is_connected INTEGER DEFAULT 0
+            is_connected INTEGER DEFAULT 0,
+            panel_type TEXT DEFAULT 'pasarguard'
         );
 
         CREATE TABLE IF NOT EXISTS coupons (
@@ -94,6 +95,32 @@ async def init_db():
             user_id INTEGER PRIMARY KEY,
             used_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            status TEXT DEFAULT 'open',
+            admin_reply TEXT DEFAULT '',
+            created_at TEXT,
+            replied_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS volume_packs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            gb INTEGER NOT NULL,
+            price INTEGER NOT NULL,
+            is_active INTEGER DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS reminder_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            sent_at TEXT,
+            UNIQUE(order_id, kind)
+        );
         """)
         await db.commit()
 
@@ -112,6 +139,12 @@ async def init_db():
             "force_channel": "",
             "force_channel_id": "0",
             "custom_username": "1",
+            "renew_enabled": "1",
+            "volume_enabled": "1",
+            "status_enabled": "1",
+            "remind_enabled": "1",
+            "remind_days": "3,1",
+            "remind_hour_utc": "8",
         }
         for k, v in defaults.items():
             await db.execute(
@@ -120,6 +153,10 @@ async def init_db():
         await db.execute(
             "INSERT OR IGNORE INTO panel (id) VALUES (1)"
         )
+        try:
+            await db.execute("ALTER TABLE panel ADD COLUMN panel_type TEXT DEFAULT 'pasarguard'")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -158,7 +195,7 @@ async def ensure_user(tg_id: int, username: str = "", full_name: str = "") -> di
             return dict(row)
 
         import secrets
-        ref_code = secrets.token_hex(3)
+        ref_code = secrets.token_hex(2)
         now = datetime.utcnow().isoformat()
         await db.execute(
             "INSERT INTO users (tg_id, username, full_name, ref_code, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -255,17 +292,24 @@ async def get_panel() -> dict:
         return dict(row) if row else {}
 
 
-async def save_panel(base_url: str, username: str, password: str, token: str = "", group_ids: str = "[]"):
+async def save_panel(base_url: str, username: str, password: str, token: str = "", group_ids: str = "[]", panel_type: str = "pasarguard"):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """UPDATE panel SET base_url=?, username=?, password=?, token=?, group_ids=?, is_connected=1
-               WHERE id=1""",
-            (base_url.rstrip("/"), username, password, token, group_ids),
+            """INSERT INTO panel (id, base_url, username, password, token, group_ids, panel_type)
+               VALUES (1, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 base_url=excluded.base_url,
+                 username=excluded.username,
+                 password=excluded.password,
+                 token=excluded.token,
+                 group_ids=excluded.group_ids,
+                 panel_type=excluded.panel_type
+            """,
+            (base_url, username, password, token, group_ids, panel_type or "pasarguard"),
         )
         await db.commit()
 
 
-# ---------- Orders & Receipts ----------
 async def create_order(user_id: int, plan_id: int, amount: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         now = datetime.utcnow().isoformat()
@@ -430,11 +474,147 @@ async def has_used_trial(user_id: int) -> bool:
         return await cur.fetchone() is not None
 
 
-async def mark_trial_used(user_id: int):
+async def claim_trial(user_id: int) -> bool:
+    """اتمیک: فقط اولین‌بار True"""
     async with aiosqlite.connect(DB_PATH) as db:
         now = datetime.utcnow().isoformat()
-        await db.execute(
-            "INSERT OR REPLACE INTO trials (user_id, used_at) VALUES (?, ?)",
-            (user_id, now),
+        try:
+            cur = await db.execute(
+                "INSERT INTO trials (user_id, used_at) VALUES (?, ?)",
+                (user_id, now),
+            )
+            await db.commit()
+            return cur.rowcount > 0
+        except Exception:
+            return False
+
+
+async def mark_trial_used(user_id: int):
+    await claim_trial(user_id)
+
+
+# ---------- Support tickets ----------
+async def create_ticket(user_id: int, message: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        now = datetime.utcnow().isoformat()
+        cur = await db.execute(
+            "INSERT INTO tickets (user_id, message, created_at) VALUES (?, ?, ?)",
+            (user_id, message[:2000], now),
         )
         await db.commit()
+        return cur.lastrowid
+
+
+async def get_open_tickets(limit: int = 30) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT t.*, u.username, u.full_name FROM tickets t
+               LEFT JOIN users u ON u.tg_id = t.user_id
+               WHERE t.status='open' ORDER BY t.id DESC LIMIT ?""",
+            (limit,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_ticket(tid: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM tickets WHERE id=?", (tid,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def reply_ticket(tid: int, reply: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        now = datetime.utcnow().isoformat()
+        cur = await db.execute(
+            "UPDATE tickets SET status='replied', admin_reply=?, replied_at=? WHERE id=? AND status='open'",
+            (reply[:2000], now, tid),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_user_orders(user_id: int, limit: int = 20) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM orders WHERE user_id=? AND status='paid' ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+# ---------- Volume packs ----------
+async def get_volume_packs(active_only: bool = True) -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        q = "SELECT * FROM volume_packs"
+        if active_only:
+            q += " WHERE is_active=1"
+        q += " ORDER BY gb, id"
+        cur = await db.execute(q)
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def add_volume_pack(title: str, gb: int, price: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO volume_packs (title, gb, price) VALUES (?, ?, ?)",
+            (title, gb, price),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def delete_volume_pack(pid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM volume_packs WHERE id=?", (pid,))
+        await db.commit()
+
+
+async def get_volume_pack(pid: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM volume_packs WHERE id=?", (pid,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_order_by_id(oid: int) -> Optional[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM orders WHERE id=?", (oid,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_all_paid_orders() -> List[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM orders WHERE status='paid' AND panel_username IS NOT NULL")
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def mark_reminder_sent(order_id: int, kind: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            now = datetime.utcnow().isoformat()
+            await db.execute(
+                "INSERT INTO reminder_log (order_id, kind, sent_at) VALUES (?, ?, ?)",
+                (order_id, kind, now),
+            )
+            await db.commit()
+            return True
+        except Exception:
+            return False
+
+
+async def was_reminder_sent(order_id: int, kind: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM reminder_log WHERE order_id=? AND kind=?",
+            (order_id, kind),
+        )
+        return await cur.fetchone() is not None
