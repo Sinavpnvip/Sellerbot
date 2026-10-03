@@ -5,27 +5,35 @@ from typing import List
 
 def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(
-        InlineKeyboardButton(text="🛒 خرید اشتراک", callback_data="shop"),
-        InlineKeyboardButton(text="✨ سرویس‌های من", callback_data="mysubs"),
-    )
+
+    # اکشن‌های اصلی
+    b.row(InlineKeyboardButton(text="🛒  خرید اشتراک جدید", callback_data="shop"))
+    b.row(InlineKeyboardButton(text="✨  سرویس‌های من", callback_data="mysubs"))
+
+    # کیف پول و پروفایل
     b.row(
         InlineKeyboardButton(text="💎 کیف پول", callback_data="wallet"),
         InlineKeyboardButton(text="👤 پروفایل", callback_data="profile"),
     )
+
+    # امکانات جانبی
     b.row(
         InlineKeyboardButton(text="🎁 تست رایگان", callback_data="trial"),
         InlineKeyboardButton(text="🤝 دعوت دوستان", callback_data="referral"),
     )
-    b.row(InlineKeyboardButton(text="💬 پشتیبانی", callback_data="support"))
+
+    # پشتیبانی
+    b.row(InlineKeyboardButton(text="💬  پشتیبانی و تیکت", callback_data="support"))
+
     if is_admin:
-        b.row(InlineKeyboardButton(text="🛠 پنل مدیریت", callback_data="admin"))
+        b.row(InlineKeyboardButton(text="🛠  پنل مدیریت", callback_data="admin"))
+
     return b.as_markup()
 
 
 def back_to_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="menu")]
+        [InlineKeyboardButton(text="🏠  بازگشت به منوی اصلی", callback_data="menu")]
     ])
 
 
